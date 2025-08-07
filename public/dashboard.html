@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Micstream Dashboard</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      max-width: 800px;
+      margin: 20px auto;
+      background: #f9f9f9;
+      color: #333;
+    }
+    h1 { text-align: center; }
+    .section {
+      background: #fff;
+      padding: 15px;
+      margin-bottom: 20px;
+      border-radius: 6px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    button {
+      font-size: 16px;
+      padding: 8px 16px;
+    }
+    ul { list-style: none; padding: 0; }
+    li { margin: 10px 0; }
+    audio { vertical-align: middle; margin-left: 10px; }
+    .status { font-weight: bold; margin-left: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Micstream Dashboard</h1>
+
+  <!-- Live Stream Section -->
+  <div class="section" id="liveSection">
+    <h2>Live Stream 
+      <button id="liveBtn" disabled>Connecting…</button>
+      <span class="status" id="liveStatus">—</span>
+    </h2>
+    <p>Speak into the phone mic to stream live here.</p>
+  </div>
+
+  <!-- Past Livestreams -->
+  <div class="section">
+    <h2>Past Livestreams</h2>
+    <ul id="liveList"><li>Loading…</li></ul>
+  </div>
+
+  <!-- Offline Recordings -->
+  <div class="section">
+    <h2>Offline Recordings</h2>
+    <ul id="recList"><li>Loading…</li></ul>
+  </div>
+
+  <script>
+    const liveBtn     = document.getElementById('liveBtn');
+    const liveStatus  = document.getElementById('liveStatus');
+    const liveList    = document.getElementById('liveList');
+    const recList     = document.getElementById('recList');
+
+    let ws;                     // WebSocket
+    let audioCtx;               // AudioContext
+    let startTime = 0;          // reference play time
+    const sampleRate = 16000;   // must match Android
+    let seqTime = 0;            // accumulated buffer time
+
+    // Fetch and render file lists
+    async function refreshLists() {
+      try {
+        const [streams, recs] = await Promise.all([
+          fetch('/api/past-streams').then(r => r.json()),
+          fetch('/api/recordings').then(r => r.json())
+        ]);
+
+        // Past livestreams
+        liveList.innerHTML = streams.length
+          ? streams.map(f => `
+              <li>
+                ${f.name}
+                <audio controls src="${f.url}"></audio>
+                <a href="${f.url}" download>Download</a>
+              </li>
+            `).join('')
+          : '<li>No past livestreams</li>';
+
+        // Offline recordings
+        recList.innerHTML = recs.length
+          ? recs.map(f => `
+              <li>
+                ${f.name}
+                <audio controls src="${f.url}"></audio>
+                <a href="${f.url}" download>Download</a>
+              </li>
+            `).join('')
+          : '<li>No offline recordings</li>';
+
+      } catch (e) {
+        console.error("List fetch error:", e);
+      }
+    }
+
+    // Initialize
+    refreshLists();
+    // Also refetch every 10s in case something missed
+    setInterval(refreshLists, 10000);
+
+    // Start / Stop live streaming
+    liveBtn.addEventListener('click', () => {
+      if (ws) stopLive();
+      else startLive();
+    });
+
+    function startLive() {
+      // Create audio context on first play
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
+      }
+      ws = new WebSocket(`ws://${location.hostname}:3000`);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        // Register as dashboard client
+        ws.send('BROWSER_CLIENT');
+        liveBtn.textContent = 'Stop Live';
+        liveStatus.textContent  = 'Streaming…';
+        // reset timing
+        startTime = audioCtx.currentTime + 0.1;
+        seqTime = 0;
+      };
+
+      ws.onmessage = evt => {
+        // Detect JSON events
+        if (typeof evt.data === 'string') {
+          try {
+            const msg = JSON.parse(evt.data);
+            if (msg.type === 'new_stream') {
+              // A new livestream was archived
+              refreshLists();
+            } else if (msg.type === 'new_recording') {
+              refreshLists();
+            }
+          } catch(_) {
+            // not JSON → ignore
+          }
+          return;
+        }
+        // Binary PCM chunk: play via Web Audio
+        const pcm = new Int16Array(evt.data);
+        const float32 = new Float32Array(pcm.length);
+        for (let i = 0; i < pcm.length; i++) {
+          float32[i] = pcm[i] / 32768;
+        }
+        const buffer = audioCtx.createBuffer(1, float32.length, sampleRate);
+        buffer.getChannelData(0).set(float32);
+
+        const src = audioCtx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(audioCtx.destination);
+        // schedule playback to avoid gaps
+        src.start(startTime + seqTime);
+        seqTime += buffer.duration;
+      };
+
+      ws.onclose = () => {
+        liveBtn.textContent = 'Play Live';
+        liveStatus.textContent = 'Offline';
+        ws = null;
+      };
+
+      ws.onerror = e => {
+        console.error("WS error:", e);
+      };
+    }
+
+    function stopLive() {
+      if (!ws) return;
+      ws.close();
+      ws = null;
+      liveBtn.textContent = 'Play Live';
+      liveStatus.textContent = 'Offline';
+    }
+
+    // When page unloads, clean up
+    window.addEventListener('beforeunload', () => {
+      if (ws) ws.close();
+    });
+
+    // Update button state after connection attempt
+    window.addEventListener('load', () => {
+      // Attempt to ping /api to see if server is up
+      fetch('/api/past-streams')
+        .then(() => {
+          liveBtn.disabled = false;
+          liveBtn.textContent = 'Play Live';
+          liveStatus.textContent = 'Idle';
+        })
+        .catch(() => {
+          liveBtn.disabled = true;
+          liveBtn.textContent = 'Server Offline';
+          liveStatus.textContent = 'Offline';
+        });
+    });
+  </script>
+</body>
+</html>
